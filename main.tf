@@ -4,6 +4,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"  # Update to the latest stable version
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"  # Update to the latest stable version
+    }
   }
 }
 
@@ -122,10 +130,10 @@ resource "aws_security_group" "worker_node_tls" {
   vpc_id      = aws_vpc.main_vpc.id
 
   ingress {
-    description              = "Allow inbound HTTPS traffic from the control plane"
-    from_port                = 443
-    to_port                  = 443
-    protocol                 = "tcp"
+    description = "Allow inbound HTTPS traffic from the control plane"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
     #source_security_group_id = aws_security_group.control_plane_tls.id # Reference control plane SG
   }
 
@@ -269,4 +277,160 @@ resource "aws_eks_node_group" "example" {
     aws_iam_role_policy_attachment.ec2_container_registry_read_only_policy,
     aws_iam_role_policy_attachment.eks_cni_policy,
   ]
+}
+
+
+
+
+#Ingress Configuration
+
+data "aws_eks_cluster_auth" "auth" {
+  name = aws_eks_cluster.cratch_cluster.name
+}
+
+
+
+
+
+resource "aws_iam_policy" "alb_ingress_controller_policy" {
+  name   = "ALBIngressControllerPolicy"
+  policy = file("alb-ingress-policy.json") # The JSON file containing the required IAM policy for ALB Controller
+}
+
+resource "aws_iam_role" "alb_ingress_controller_role" {
+  name = "ALBIngressControllerRole"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "eks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_alb_policy" {
+  policy_arn = aws_iam_policy.alb_ingress_controller_policy.arn
+  role       = aws_iam_role.alb_ingress_controller_role.name
+}
+
+
+provider "kubernetes" {
+  host                   = aws_eks_cluster.cratch_cluster.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.cratch_cluster.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.auth.token
+}
+
+resource "kubernetes_service_account" "alb_ingress_sa" {
+  metadata {
+    name      = "alb-ingress-controller"
+    namespace = "kube-system"
+    annotations = {
+      "eks.amazonaws.com/role-arn" = aws_iam_role.alb_ingress_controller_role.arn
+    }
+  }
+}
+
+
+provider "helm" {
+  kubernetes {
+    host                   = aws_eks_cluster.cratch_cluster.endpoint
+    cluster_ca_certificate = base64decode(aws_eks_cluster.cratch_cluster.certificate_authority[0].data)
+    token                  = data.aws_eks_cluster_auth.auth.token
+  }
+}
+
+resource "helm_release" "alb_ingress_controller" {
+  name       = "aws-load-balancer-controller"
+  namespace  = "kube-system"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+
+  set {
+    name  = "clusterName"
+    value = "cratch_cluster"
+  }
+
+  set {
+    name  = "serviceAccount.create"
+    value = "false"
+  }
+
+  set {
+    name  = "serviceAccount.name"
+    value = "alb-ingress-controller"
+  }
+
+  set {
+    name  = "region"
+    value = "eu-central-a"
+  }
+
+  set {
+    name  = "vpcId"
+    value = aws_vpc.main_vpc.id
+  }
+}
+
+
+
+resource "kubernetes_ingress_v1" "example_ingress" {
+  metadata {
+    name = "example-ingress"
+    namespace = "default"
+    annotations = {
+      "kubernetes.io/ingress.class"      = "alb"
+      "alb.ingress.kubernetes.io/scheme" = "internet-facing"
+    }
+  }
+
+  spec {
+    default_backend {
+      service {
+        name = "myapp-1"
+        port {
+          number = 8080
+        }
+      }
+    }
+
+    rule {
+      http {
+        path {
+          backend {
+            service {
+              name = "myapp-1"
+              port {
+                number = 8080
+              }
+            }
+          }
+
+          path = "/app1/*"
+        }
+
+        path {
+          backend {
+            service {
+              name = "myapp-2"
+              port {
+                number = 8080
+              }
+            }
+          }
+
+          path = "/app2/*"
+        }
+      }
+    }
+
+    tls {
+      secret_name = "tls-secret"
+    }
+  }
 }
