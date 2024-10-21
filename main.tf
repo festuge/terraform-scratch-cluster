@@ -368,7 +368,7 @@ resource "helm_release" "alb_ingress_controller" {
 
   set {
     name  = "region"
-    value = "eu-central-a"
+    value = "eu-central-1"
   }
 
   set {
